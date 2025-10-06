@@ -1,32 +1,24 @@
 import os
-import pdb
 import time
-from typing import Optional
-
-import faiss
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn.functional as F
-from util import metrics
 from util.args_loader import get_args
+from util import metrics
+import torch
+import faiss
+import numpy as np
+import torchvision.models as models
+from typing import Optional
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import torch.nn as nn
 
 
-def in_distribution_accuracy(score_in: np.ndarray, labels_in: np.ndarray) -> float:
-    preds_in = score_in.argmax(1)
-    num_correct = (preds_in == labels_in).sum().item()
-    # print
-    print(
-        f"Accuracy: {num_correct / len(labels_in):.4f} ({num_correct}/{len(labels_in)})"
-    )
-    # print class wise accuracy
-    for i in range(score_in.shape[1]):
-        class_correct = (preds_in[labels_in == i] == i).sum().item()
-        class_total = (labels_in == i).sum().item()
-        print(
-            f"Class {i} accuracy: {class_correct / class_total:.4f} ({class_correct}/{class_total})"
-        )
-    return num_correct / len(labels_in)
+class LinearProbe(nn.Module):
+    def __init__(self, in_features, num_classes):
+        super(LinearProbe, self).__init__()
+        self.fc = nn.Linear(in_features, num_classes)
+
+    def forward(self, x):
+        return self.fc(x)
 
 
 def plot_helper(
@@ -42,14 +34,14 @@ def plot_helper(
     if ood_dataset_name == "dtd":
         ood_dataset_name = "Texture"
     print(ood_dataset_name)
-    # plt.xlabel('LAFO(x)', fontsize=16)
+    plt.xlabel("LAFO(x)", fontsize=16)
     # plt.xlabel(r'$\sin(\theta) / \sin(\alpha)$', fontsize=16)
     # plt.xlabel(r'$\sin(\theta)$', fontsize=16)
-    plt.xlabel(r"$\sin(\alpha)$", fontsize=16)
+    # plt.xlabel(r'$\sin(\alpha)$', fontsize=16)
     # plt.xlabel(r'$\theta$', fontsize=16)
     plt.ylabel("Density", fontsize=16)
     plt.title(f"{in_dataset} vs {ood_dataset_name}", fontsize=16)
-    plt.savefig(f"./{in_dataset}_{ood_dataset_name}_sinalpha.png", dpi=600)
+    plt.savefig(f"./{in_dataset}_{ood_dataset_name}_LAFO.png", dpi=600)
     plt.close()
 
 
@@ -102,7 +94,9 @@ def fdbd_score(
     with torch.inference_mode():
         for feats_batch_initial, logits_batch_initial in test_loader:
             feats_batch_initial = feats_batch_initial.to(device)
-            logits_batch_initial = logits_batch_initial.to(device)
+            logits_batch_initial = model.fc(feats_batch_initial.float())
+
+            # logits_batch_initial = logits_batch_initial.to(device)
             preds_initial = logits_batch_initial.argmax(1)
             max_logits = logits_batch_initial.max(dim=1).values
             trajectory_list = torch.zeros(
@@ -111,6 +105,8 @@ def fdbd_score(
             for class_id in class_idx:
                 logit_diff = max_logits - logits_batch_initial[:, class_id]
                 weight_diff = model.fc.weight[preds_initial] - model.fc.weight[class_id]
+                # weight_diff = model.classifier.weight[preds_initial] - model.classifier.weight[class_id]
+
                 weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
                 feats_batch_db = (
                     feats_batch_initial
@@ -141,7 +137,6 @@ def fdbd_score(
                     feats_centered_db, mean_centered_db, dim=1
                 )
                 angles_db = torch.arccos(cos_sim) / torch.pi
-
                 our_derivation = torch.sin(angles_origin * torch.pi) / torch.sin(
                     angles_db * torch.pi
                 )
@@ -154,217 +149,9 @@ def fdbd_score(
                 # # print(torch.allclose(fdbd_score, our_derivation))
 
                 trajectory_list[:, class_id] = our_derivation
-
             trajectory_list[torch.isnan(trajectory_list)] = 0
             ood_score = torch.mean(trajectory_list, dim=1)
             # ood_score = torch.max(trajectory_list, dim=1).values
-            all_scores.append(ood_score)
-    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
-    return scores
-
-
-def lafo_score(
-    model: torch.nn.Module,
-    test_loader: torch.utils.data.DataLoader,
-    num_classes: int,
-    class_means: torch.Tensor,
-    device: str,
-    thold: Optional[torch.Tensor] = None,
-) -> np.ndarray:
-    model = model.to(device)
-    model.eval()
-
-    all_scores = []
-    total_size = 0
-
-    class_idx = np.arange(num_classes)
-
-    with torch.inference_mode():
-        for feats_batch_initial, logits_batch_initial in test_loader:
-            feats_batch_initial = feats_batch_initial.to(device)
-            logits_batch_initial = logits_batch_initial.to(device)
-            if thold is not None:
-                feats_batch_initial = react_filter(feats_batch_initial, thold).float()
-                logits_batch_initial = model.fc(feats_batch_initial)
-            preds_initial = logits_batch_initial.argmax(1)
-            max_logits = logits_batch_initial.max(dim=1).values
-            total_size += feats_batch_initial.size(0)
-            trajectory_list = torch.zeros(
-                feats_batch_initial.size(0), num_classes, device=device
-            )
-            for class_id in class_idx:
-                logit_diff = max_logits - logits_batch_initial[:, class_id]
-                weight_diff = model.fc.weight[preds_initial] - model.fc.weight[class_id]
-                weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
-
-                feats_batch_db = (
-                    feats_batch_initial
-                    - torch.divide(logit_diff, weight_diff_norm**2).view(-1, 1)
-                    * weight_diff
-                )
-
-                centered_feats = feats_batch_initial - torch.mean(class_means, dim=0)
-                centered_feats_db = feats_batch_db - torch.mean(class_means, dim=0)
-                # centered_feats = feats_batch_initial - torch.median(class_means, dim=0).values
-                # centered_feats_db = feats_batch_db - torch.median(class_means, dim=0).values
-
-                norm_centered_feats = F.normalize(centered_feats, p=2, dim=1)
-                norm_centered_feats_db = F.normalize(centered_feats_db, p=2, dim=1)
-
-                cos_sim_origin_perspective = torch.sum(
-                    norm_centered_feats * norm_centered_feats_db, dim=1
-                )
-                angles_origin = torch.arccos(cos_sim_origin_perspective) / torch.pi
-                # angles_origin = 1 - cos_sim_origin_perspective
-                # angles_origin = torch.arccos(cos_sim_origin_perspective)
-                trajectory_list[:, class_id] = angles_origin
-
-            trajectory_list[torch.isnan(trajectory_list)] = 0
-            ood_score = torch.max(trajectory_list, dim=1).values
-            # ood_score = torch.topk(trajectory_list, 2, largest=False, dim=1).values[:, 1]
-            # ood_score = torch.mean(trajectory_list, dim=1)
-            all_scores.append(ood_score)
-    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
-    return scores
-
-
-@torch.no_grad()
-def lafo_score_normalised(
-    model: torch.nn.Module,
-    test_loader: torch.utils.data.DataLoader,
-    num_classes: int,
-    class_means: torch.Tensor,  # shape: [num_classes, feat_dim]
-    device: str,
-    thold: Optional[torch.Tensor] = None,  # kept only for API compatibility
-) -> np.ndarray:
-    """
-    Angle‑based LAFO OOD score that is *scale‑invariant*.
-
-    Changes w.r.t. the original version
-    -----------------------------------
-    1. **Per‑sample L2 normalisation** of every feature vector
-       -> kills any upstream scaling.
-    2. **Directional ID mean**  μ̂  computed once from the (already
-       normalised) `class_means`.
-    3. Everything else (logits, projection, angle) is done in this
-       normalised space, so the final scores and the 95‑th‑percentile
-       threshold cannot change when the raw features are rescaled.
-    """
-
-    model = model.to(device).eval()
-
-    # ------------------------------------------------------------------
-    # 0.  Prepare constants on the correct device
-    # ------------------------------------------------------------------
-    # Make sure each prototype is unit‑norm (directional mean on S^{d-1})
-    class_means = F.normalize(class_means.to(device), p=2, dim=1)  # [C, D]
-    mu_hat = F.normalize(class_means.mean(dim=0, keepdim=True), p=2, dim=1)  # [1, D]
-
-    weight = model.fc.weight.to(device)  # [C, D]   (no bias expected)
-    bias = getattr(model.fc, "bias", None)  # kept if the head has bias
-
-    all_scores = []
-    class_idx = torch.arange(num_classes, device=device)
-
-    # ------------------------------------------------------------------
-    # 1.  Main loop
-    # ------------------------------------------------------------------
-    for feats_raw, _ in test_loader:  # logits will be recomputed
-        feats_raw = feats_raw.to(device)  # [B, D]
-        feats_hat = F.normalize(feats_raw.float(), p=2, dim=1)  # [B, D]
-
-        # logits computed *after* normalisation  -----------------------
-        logits = F.linear(feats_hat, weight, bias)  # [B, C]
-        preds = logits.argmax(dim=1)  # [B]
-        max_logits = logits.max(dim=1).values  # [B]
-
-        # initialise per‑batch score container
-        B = feats_hat.size(0)
-        trajectory = feats_hat.new_zeros(B, num_classes)  # [B, C]
-
-        # centre the features once per batch (from ID mean perspective)
-        centred = feats_hat - mu_hat  # [B, D]
-
-        # --------------------------------------------------------------
-        # 2.  Iterate over alternative classes and form the triangle
-        # --------------------------------------------------------------
-        for cls in class_idx:
-            # decision‑boundary projection of each sample wrt (pred, cls)
-            logit_diff = max_logits - logits[:, cls]  # [B]
-            w_diff = weight[preds] - weight[cls]  # [B, D]
-            w_norm2 = w_diff.square().sum(dim=1)  # [B]
-
-            feats_db = feats_hat - (logit_diff / w_norm2).unsqueeze(1) * w_diff
-            centred_db = feats_db - mu_hat  # [B, D]
-
-            # normalise the two rays emanating from μ̂ ------------------
-            v1 = F.normalize(centred, p=2, dim=1)  # [B, D]
-            v2 = F.normalize(centred_db, p=2, dim=1)
-
-            # angle (0…π)  →  divide by π to keep the original scale
-            cos_sim = (v1 * v2).sum(dim=1).clamp(-1.0, 1.0)  # [B]
-            angles = torch.arccos(cos_sim) / torch.pi  # [B]
-
-            trajectory[:, cls] = angles
-
-        trajectory[torch.isnan(trajectory)] = 0.0
-        all_scores.append(trajectory.max(dim=1).values)  # [B]
-        # all_scores.append(trajectory.min(dim=1).values)  # [B]
-
-    # ------------------------------------------------------------------
-    # 3.  Collect everything on CPU and return
-    # ------------------------------------------------------------------
-    scores = torch.cat(all_scores).cpu().numpy().astype(np.float32)  # [N]
-    return scores
-
-
-def distance_score(
-    model: torch.nn.Module,
-    test_loader: torch.utils.data.DataLoader,
-    num_classes: int,
-    class_means: torch.Tensor,
-    device: str,
-    thold: Optional[torch.Tensor] = None,
-) -> np.ndarray:
-    model = model.to(device)
-    model.eval()
-
-    all_scores = []
-    total_size = 0
-
-    class_idx = np.arange(num_classes)
-
-    with torch.inference_mode():
-        for feats_batch_initial, logits_batch_initial in test_loader:
-            feats_batch_initial = feats_batch_initial.to(device)
-            logits_batch_initial = logits_batch_initial.to(device)
-            if thold is not None:
-                feats_batch_initial = react_filter(feats_batch_initial, thold).float()
-                logits_batch_initial = model.fc(feats_batch_initial)
-            preds_initial = logits_batch_initial.argmax(1)
-            max_logits = logits_batch_initial.max(dim=1).values
-            total_size += feats_batch_initial.size(0)
-            trajectory_list = torch.zeros(
-                feats_batch_initial.size(0), num_classes, device=device
-            )
-            for class_id in class_idx:
-                logit_diff = max_logits - logits_batch_initial[:, class_id]
-                weight_diff = model.fc.weight[preds_initial] - model.fc.weight[class_id]
-                weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
-
-                feats_batch_db = (
-                    feats_batch_initial
-                    - torch.divide(logit_diff, weight_diff_norm**2).view(-1, 1)
-                    * weight_diff
-                )
-                diff = feats_batch_initial - feats_batch_db
-                distance = torch.linalg.norm(diff, dim=-1)
-                trajectory_list[:, class_id] = distance
-
-            trajectory_list[torch.isnan(trajectory_list)] = 0
-            ood_score = torch.max(trajectory_list, dim=1).values
-            # ood_score = torch.topk(trajectory_list, 2, largest=False, dim=1).values[:, 1]
-            # ood_score = torch.mean(trajectory_list, dim=1)
             all_scores.append(ood_score)
     scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
     return scores
@@ -390,9 +177,9 @@ def lafo_score3(
         for feats_batch_initial, logits_batch_initial in test_loader:
             feats_batch_initial = feats_batch_initial.to(device)
             logits_batch_initial = logits_batch_initial.to(device)
-            if thold is not None:
-                feats_batch_initial = react_filter(feats_batch_initial, thold).float()
-                logits_batch_initial = model.fc(feats_batch_initial)
+            # if thold is not None:
+            #     feats_batch_initial = react_filter(feats_batch_initial, thold).float()
+            #     logits_batch_initial = model.fc(feats_batch_initial)
             preds_initial = logits_batch_initial.argmax(1)
             max_logits = logits_batch_initial.max(dim=1).values
             total_size += feats_batch_initial.size(0)
@@ -405,6 +192,7 @@ def lafo_score3(
                     weight_diff = (
                         model.fc.weight[preds_initial] - model.fc.weight[class_id]
                     )
+                    # weight_diff = model.classifier.weight[preds_initial] - model.classifier.weight[class_id]
                     weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
 
                     feats_batch_db = (
@@ -414,12 +202,20 @@ def lafo_score3(
                     )
                     if stat == 0:
                         centered_feats = (
+                            feats_batch_initial - torch.max(class_means, dim=0).values
+                        )
+                        centered_feats_db = (
+                            feats_batch_db - torch.max(class_means, dim=0).values
+                        )
+
+                    elif stat == 1:
+                        centered_feats = (
                             feats_batch_initial - torch.min(class_means, dim=0).values
                         )
                         centered_feats_db = (
                             feats_batch_db - torch.min(class_means, dim=0).values
                         )
-                    elif stat == 1:
+                    elif stat == 2:
                         centered_feats = (
                             feats_batch_initial
                             - torch.median(class_means, dim=0).values
@@ -427,17 +223,162 @@ def lafo_score3(
                         centered_feats_db = (
                             feats_batch_db - torch.median(class_means, dim=0).values
                         )
-                    elif stat == 2:
-                        centered_feats = (
-                            feats_batch_initial
-                            - torch.max(feats_batch_initial, dim=0).values
-                        )
-                        centered_feats_db = (
-                            feats_batch_db
-                            - torch.max(feats_batch_initial, dim=0).values
-                        )
+
+                    # centered_feats = feats_batch_initial - torch.mean(class_means, dim=0)
+                    # centered_feats_db = feats_batch_db - torch.mean(class_means, dim=0)
                     # centered_feats = feats_batch_initial - torch.median(class_means, dim=0).values
                     # centered_feats_db = feats_batch_db - torch.median(class_means, dim=0).values
+                    # centered_feats = feats_batch_initial - class_means[0]
+                    # centered_feats_db = feats_batch_db - class_means[0]
+
+                    norm_centered_feats = F.normalize(centered_feats, p=2, dim=1)
+                    norm_centered_feats_db = F.normalize(centered_feats_db, p=2, dim=1)
+
+                    cos_sim_origin_perspective = torch.sum(
+                        norm_centered_feats * norm_centered_feats_db, dim=1
+                    )
+                    angles_origin = torch.arccos(cos_sim_origin_perspective) / torch.pi
+                    trajectory_list[:, class_id] += angles_origin
+
+            trajectory_list[torch.isnan(trajectory_list)] = 0
+            ood_score = torch.max(trajectory_list, dim=1).values
+            # ood_score = torch.topk(trajectory_list, 2, largest=False, dim=1).values[:, 1]
+            # ood_score = torch.mean(trajectory_list, dim=1)
+            all_scores.append(ood_score)
+    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
+    return scores
+
+
+def lafo_score(
+    model: torch.nn.Module,
+    test_loader: torch.utils.data.DataLoader,
+    num_classes: int,
+    class_means: torch.Tensor,
+    device: str,
+    thold: Optional[torch.Tensor] = None,
+    text_features: Optional[torch.Tensor] = None,
+    dataset_name: Optional[str] = None,
+) -> np.ndarray:
+    model = model.to(device)
+    model.eval()
+
+    text_features = text_features.to(device)
+    class_means = F.normalize(class_means, dim=-1).float()
+
+    all_scores = []
+    total_size = 0
+
+    class_idx = np.arange(num_classes)
+
+    with torch.inference_mode():
+        for feats_batch_initial, logits_batch_initial in test_loader:
+            feats_batch_initial = feats_batch_initial.to(device)
+
+            image_features = F.normalize(feats_batch_initial, dim=-1).float()
+            text_features = F.normalize(text_features, dim=-1).float()
+            probs = torch.sigmoid(image_features @ text_features.T)
+            preds_initial = probs.argmax(1)
+
+            total_size += feats_batch_initial.size(0)
+            trajectory_list = torch.zeros(
+                feats_batch_initial.size(0), num_classes, device=device
+            )
+            for class_id in class_idx:
+                pred_text_feats = text_features[preds_initial]
+                target_text_feats = text_features[class_id]
+
+                diff = pred_text_feats - target_text_feats
+                diff_norm = F.normalize(diff, p=2, dim=1)
+
+                # image_features: BxD, diff_norm: BxD
+                # image_feats_db = (
+                #     image_features
+                #     - torch.sum(torch.multiply(image_features, diff_norm), dim=1).view(
+                #         -1, 1
+                #     )
+                #     * diff_norm
+                # )
+                image_feats_db = (
+                    image_features
+                    - torch.einsum("ij,ij->i", image_features, diff_norm).view(-1, 1)
+                    * diff_norm
+                )
+
+                feats_batch_db = F.normalize(image_feats_db, p=2, dim=1)
+
+                centered_feats = image_features - torch.mean(class_means, dim=0)
+                centered_feats_db = feats_batch_db - torch.mean(class_means, dim=0)
+
+                norm_centered_feats = F.normalize(centered_feats, p=2, dim=1)
+                norm_centered_feats_db = F.normalize(centered_feats_db, p=2, dim=1)
+
+                cos_sim_origin_perspective = torch.sum(
+                    norm_centered_feats * norm_centered_feats_db, dim=1
+                )
+                angles_origin = torch.arccos(cos_sim_origin_perspective) / torch.pi
+
+                # # fdbd original
+                # distance_to_db = torch.linalg.norm(image_features - feats_batch_db, dim=1)
+                # fdbd_score = distance_to_db / torch.linalg.norm(image_features - torch.mean(class_means, dim=0), dim=1)
+
+                trajectory_list[:, class_id] = angles_origin
+
+            trajectory_list[torch.isnan(trajectory_list)] = 0
+            ood_score = torch.max(trajectory_list, dim=1).values
+            # ood_score = torch.topk(trajectory_list, 2, largest=False, dim=1).values[:, 1]
+            # ood_score = torch.mean(trajectory_list, dim=1)
+            all_scores.append(ood_score)
+    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
+    return scores
+
+
+def lafo_score2(
+    model: torch.nn.Module,
+    test_loader: torch.utils.data.DataLoader,
+    num_classes: int,
+    class_means: torch.Tensor,
+    device: str,
+    thold: Optional[torch.Tensor] = None,
+) -> np.ndarray:
+    model = model.to(device)
+    model.eval()
+
+    all_scores = []
+    total_size = 0
+
+    class_idx = np.arange(num_classes)
+
+    with torch.inference_mode():
+        for feats_batch_initial, logits_batch_initial in test_loader:
+            feats_batch_initial = feats_batch_initial.to(device)
+            logits_batch_initial = logits_batch_initial.to(device)
+            if thold is not None:
+                feats_batch_initial = react_filter(feats_batch_initial, thold).float()
+                logits_batch_initial = model.fc(feats_batch_initial)
+            preds_initial = logits_batch_initial.argmax(1)
+            max_logits = logits_batch_initial.max(dim=1).values
+            total_size += feats_batch_initial.size(0)
+            trajectory_list = torch.zeros(
+                feats_batch_initial.size(0), num_classes, device=device
+            )
+            for class_id2 in [1, 250, 500, 750, 999]:
+                for class_id in class_idx:
+                    logit_diff = max_logits - logits_batch_initial[:, class_id]
+                    weight_diff = (
+                        model.fc.weight[preds_initial] - model.fc.weight[class_id]
+                    )
+                    weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
+
+                    feats_batch_db = (
+                        feats_batch_initial
+                        - torch.divide(logit_diff, weight_diff_norm**2).view(-1, 1)
+                        * weight_diff
+                    )
+
+                    # centered_feats = feats_batch_initial - torch.mean(class_means, dim=0)
+                    # centered_feats_db = feats_batch_db - torch.mean(class_means, dim=0)
+                    centered_feats = feats_batch_initial - class_means[class_id2]
+                    centered_feats_db = feats_batch_db - class_means[class_id2]
 
                     norm_centered_feats = F.normalize(centered_feats, p=2, dim=1)
                     norm_centered_feats_db = F.normalize(centered_feats_db, p=2, dim=1)
@@ -471,7 +412,8 @@ def energy_score(
     with torch.inference_mode():
         for feats_batch_initial, logits_batch_initial in test_loader:
             feats_batch_initial = feats_batch_initial.to(device)
-            logits_batch_initial = logits_batch_initial.to(device)
+            # logits_batch_initial = logits_batch_initial.to(device)
+            logits_batch_initial = model.fc(feats_batch_initial.float())
             energies = torch.logsumexp(logits_batch_initial, dim=1)
             all_scores.append(energies)
     scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
@@ -485,6 +427,7 @@ def msp_score(
     class_means: torch.Tensor,
     device: str,
     thold: Optional[torch.Tensor] = None,
+    dataset_name: Optional[str] = None,
 ) -> np.ndarray:
     model = model.to(device)
     model.eval()
@@ -492,10 +435,13 @@ def msp_score(
     with torch.inference_mode():
         for feats_batch_initial, logits_batch_initial in test_loader:
             feats_batch_initial = feats_batch_initial.to(device)
-            logits_batch_initial = logits_batch_initial.to(device)
+            logits_batch_initial = model.fc(feats_batch_initial.float())
+            # logits_batch_initial = logits_batch_initial.to(device)
             probs = F.softmax(logits_batch_initial, dim=1)
             max_probs = torch.max(probs, dim=1).values
             all_scores.append(max_probs)
+            # if dataset_name:
+            # breakpoint()
     scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
     return scores
 
@@ -507,7 +453,7 @@ def knn_score(
     class_means: torch.Tensor,
     device: str,
     train_feats: torch.Tensor,
-    k: Optional[torch.Tensor] = 50,
+    k: Optional[torch.Tensor] = 1000,
 ) -> np.ndarray:
     model = model.to(device)
     model.eval()
@@ -531,25 +477,99 @@ def knn_score(
     return scores
 
 
-torch.manual_seed(1)
-torch.cuda.manual_seed(1)
-np.random.seed(1)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+def MCM_score(
+    model: torch.nn.Module,
+    test_loader: torch.utils.data.DataLoader,
+    num_classes: int,
+    class_means: torch.Tensor,
+    device: str,
+    thold: Optional[torch.Tensor] = None,
+    text_features: Optional[torch.Tensor] = None,
+    dataset_name: Optional[str] = None,
+) -> np.ndarray:
+    model = model.to(device)
+    model.eval()
+
+    text_features = text_features.to(device)
+    class_means = F.normalize(class_means, dim=-1).float()
+
+    all_scores = []
+    total_size = 0
+
+    class_idx = np.arange(num_classes)
+
+    with torch.inference_mode():
+        for feats_batch_initial, logits_batch_initial in test_loader:
+            feats_batch_initial = feats_batch_initial.to(device)
+
+            image_features = F.normalize(feats_batch_initial, dim=-1).float()
+            text_features = F.normalize(text_features, dim=-1).float()
+            # probs = torch.sigmoid(image_features @ text_features.T)
+            # preds_initial = probs.argmax(1)
+            # calculate softmax probabilities too
+            probs = F.softmax(image_features @ text_features.T, dim=1)
+            ood_score = torch.max(probs, dim=1).values
+            all_scores.append(ood_score)
+    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
+    return scores
+
+
+def plain_cos_score(
+    model: torch.nn.Module,
+    test_loader: torch.utils.data.DataLoader,
+    num_classes: int,
+    class_means: torch.Tensor,
+    device: str,
+    thold: Optional[torch.Tensor] = None,
+    text_features: Optional[torch.Tensor] = None,
+    dataset_name: Optional[str] = None,
+) -> np.ndarray:
+    model = model.to(device)
+    model.eval()
+
+    text_features = text_features.to(device)
+    class_means = F.normalize(class_means, dim=-1).float()
+
+    all_scores = []
+    total_size = 0
+
+    class_idx = np.arange(num_classes)
+
+    with torch.inference_mode():
+        for feats_batch_initial, logits_batch_initial in test_loader:
+            feats_batch_initial = feats_batch_initial.to(device)
+
+            image_features = F.normalize(feats_batch_initial, dim=-1).float()
+            text_features = F.normalize(text_features, dim=-1).float()
+            probs = image_features @ text_features.T
+            # preds_initial = probs.argmax(1)
+            # calculate softmax probabilities too
+            # probs = F.softmax(image_features @ text_features.T, dim=1)
+            ood_score = torch.max(probs, dim=1).values
+            all_scores.append(ood_score)
+    scores = np.asarray(torch.cat(all_scores).detach().cpu().numpy(), dtype=np.float32)
+    return scores
+
 
 args = get_args()
 
+seed = args.seed
+print(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+np.random.seed(seed)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-# load collected features
-
-class_num = 10
-id_train_size = 50000
-id_val_size = 10000
+class_num = 1000
+id_train_size = 1281167
+id_val_size = 50000
 
 cache_dir = f"cache/{args.in_dataset}_train_{args.name}_in"
 feat_log = torch.from_numpy(
     np.memmap(
-        f"{cache_dir}/feat.mmap", dtype=float, mode="r", shape=(id_train_size, 512)
+        f"{cache_dir}/feat.mmap", dtype=float, mode="r", shape=(id_train_size, 1024)
     )
 ).to(device)
 score_log = torch.from_numpy(
@@ -567,7 +587,9 @@ label_log = torch.from_numpy(
 
 cache_dir = f"cache/{args.in_dataset}_val_{args.name}_in"
 feat_log_val = torch.from_numpy(
-    np.memmap(f"{cache_dir}/feat.mmap", dtype=float, mode="r", shape=(id_val_size, 512))
+    np.memmap(
+        f"{cache_dir}/feat.mmap", dtype=float, mode="r", shape=(id_val_size, 1024)
+    )
 ).to(device)
 score_log_val = torch.from_numpy(
     np.memmap(
@@ -579,25 +601,36 @@ label_log_val = torch.from_numpy(
 ).to(device)
 
 
-ood_feat_score_log = {}
-ood_dataset_size = {
-    "SVHN": 26032,
-    "iSUN": 8925,
-    "places365": 10000,
-    "dtd": 5640,
-    "cifar100": 50000,
-}
+from transformers import CLIPVisionModel
 
-in_distribution_accuracy(score_log_val.cpu().numpy(), label_log_val.cpu().numpy())
-exit()
-ood_feat_log_all = {}
+# model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
+# linear_probe = LinearProbe(featdim, num_classes)
+
+from open_clip import create_model_from_pretrained, get_tokenizer
+
+model, preprocess = create_model_from_pretrained("hf-hub:apple/DFN5B-CLIP-ViT-H-14-384")
+tokenizer = get_tokenizer("ViT-H-14")
+
+with open("imagenet_classes.txt") as f:
+    labels_list = f.read().splitlines()
+
+text = tokenizer(labels_list, context_length=model.context_length)
+text_features = model.encode_text(text)
+
+
+model = model.to(device)
+
+
+ood_feat_score_log = {}
+ood_dataset_size = {"inat": 10000, "sun50": 10000, "places50": 10000, "dtd": 5640}
+
 for ood_dataset in args.out_datasets:
     ood_feat_log = torch.from_numpy(
         np.memmap(
             f"cache/{ood_dataset}vs{args.in_dataset}_{args.name}_out/feat.mmap",
             dtype=float,
             mode="r",
-            shape=(ood_dataset_size[ood_dataset], 512),
+            shape=(ood_dataset_size[ood_dataset], 1024),
         )
     ).to(device)
     ood_score_log = torch.from_numpy(
@@ -613,24 +646,27 @@ for ood_dataset in args.out_datasets:
 
 ######## get w, b; precompute demoninator matrix, training feature mean  #################
 
-if args.name == "resnet18":
-    checkpoint = torch.load("ckpt/CIFAR10_resnet18.pth.tar")
-    w = checkpoint["state_dict"]["fc.weight"]
-    b = checkpoint["state_dict"]["fc.bias"]
-elif args.name == "resnet18-supcon":
-    checkpoint = torch.load("ckpt/CIFAR10_resnet18_supcon_linear.pth")
+if args.name == "resnet50":
+    net = models.resnet50(pretrained=True)
+    for i, param in enumerate(net.fc.parameters()):
+        if i == 0:
+            w = param.data
+        else:
+            b = param.data
+
+elif args.name == "resnet50-supcon":
+    checkpoint = torch.load("ckpt/ImageNet_resnet50_supcon_linear.pth")
     w = checkpoint["model"]["fc.weight"]
     b = checkpoint["model"]["fc.bias"]
 
 train_mean = torch.mean(feat_log, dim=0).to(device)
 
-denominator_matrix = torch.zeros((10, 10)).to(device)
-for p in range(10):
-    w_p = w - w[p, :]
-    denominator = torch.norm(w_p, dim=1)
-    denominator[p] = 1
-    denominator_matrix[p, :] = denominator
-
+denominator_matrix = torch.zeros((1000, 1000)).to(device)
+# for p in range(1000):
+#   w_p = w - w[p,:]
+#   denominator = torch.norm(w_p, dim=1)
+#   denominator[p] = 1
+#   denominator_matrix[p, :] = denominator
 
 #################### fDBD score OOD detection #################
 
@@ -638,46 +674,71 @@ all_results = []
 all_score_out = []
 
 values, nn_idx = score_log_val.max(1)
-logits_sub = torch.abs(score_log_val - values.repeat(10, 1).T)
+logits_sub = torch.abs(score_log_val - values.repeat(1000, 1).T)
 # pdb.set_trace()
 # score_in = torch.sum(logits_sub/denominator_matrix[nn_idx], axis=1)/torch.norm(feat_log_val - train_mean , dim = 1)
 # score_in = score_in.float().cpu().numpy()
 
+model = LinearProbe(1024, 1000)
+model.load_state_dict(torch.load("./linear_probe.pth"))
+model = model.to(device)
 
-"""
-model: torch.nn.Module,
-test_loader: torch.utils.data.DataLoader,
-num_classes: int,
-class_means: torch.Tensor,
-device: str,
-"""
-from util.model_loader import get_model
-
-model = get_model(args, 10, load_ckpt=True)
 in_dataset = torch.utils.data.TensorDataset(feat_log_val.cpu(), score_log_val.cpu())
 in_loader = torch.utils.data.DataLoader(
     in_dataset, batch_size=128, shuffle=False, num_workers=2
 )
 
 class_means = []
-for i in range(10):
+for i in range(1000):
     class_means.append(feat_log_val[label_log_val == i].mean(0))
 class_means = torch.stack(class_means).to(device)
 
-# tholds = react_thold(feat_log, percentile=95)
+# tholds = react_thold(feat_log, percentile=75)
 tholds = None
 # tholds = torch.from_numpy(tholds).to(device)
-score_in = lafo_score(model, in_loader, 10, class_means, device, tholds)
-# score_in = lafo_score_normalised(model, in_loader, 10, class_means, device, tholds)
-# score_in = distance_score(model, in_loader, 10, class_means, device, tholds)
-# score_in = fdbd_score(model, in_loader, 10, class_means, device)
-# score_in = React_energy(model, in_loader, 10, class_means, device, tholds)
+score_in = lafo_score(
+    model,
+    in_loader,
+    1000,
+    class_means,
+    device,
+    thold=tholds,
+    text_features=text_features,
+    dataset_name=None,
+)
+# score_in = MCM_score(
+#     model,
+#     in_loader,
+#     1000,
+#     class_means,
+#     device,
+#     thold=tholds,
+#     text_features=text_features,
+#     dataset_name=None,
+# )
+# score_in = plain_cos_score(
+#     model,
+#     in_loader,
+#     1000,
+#     class_means,
+#     device,
+#     thold=tholds,
+#     text_features=text_features,
+#     dataset_name=None,
+# )
+# score_in = energy_score(model, in_loader, 1000, class_means, device, tholds)
+# score_in = msp_score(model, in_loader, 1000, class_means, device, tholds)
+# score_in = fdbd_score(model, in_loader, 1000, class_means, device)
+# score_in = React_energy(model, in_loader, 1000, class_means, device, tholds)
+# breakpoint()
 train_feats = feat_log[:]
-# score_in = knn_score(model, in_loader, 10, class_means, device, train_feats)
+# score_in = knn_score(model, in_loader, 1000, class_means, device, train_feats)
+
 
 for ood_dataset, (feat_log, score_log) in ood_feat_score_log.items():
+    print(ood_dataset)
     values, nn_idx = score_log.max(1)
-    logits_sub = torch.abs(score_log - values.repeat(10, 1).T)
+    logits_sub = torch.abs(score_log - values.repeat(1000, 1).T)
     # scores_out_test = torch.sum(logits_sub/denominator_matrix[nn_idx], axis=1)/torch.norm(feat_log - train_mean , dim = 1)
     # scores_out_test = scores_out_test.float().cpu().numpy()
     out_loader = torch.utils.data.DataLoader(
@@ -686,62 +747,53 @@ for ood_dataset, (feat_log, score_log) in ood_feat_score_log.items():
         shuffle=False,
         num_workers=2,
     )
-    scores_out_test = lafo_score(model, out_loader, 10, class_means, device, tholds)
-    # scores_out_test = lafo_score_normalised(
-    #     model, out_loader, 10, class_means, device, tholds
+    scores_out_test = lafo_score(
+        model,
+        out_loader,
+        1000,
+        class_means,
+        device,
+        thold=tholds,
+        text_features=text_features,
+        dataset_name=ood_dataset,
+    )
+    # scores_out_test = MCM_score(
+    #     model,
+    #     out_loader,
+    #     1000,
+    #     class_means,
+    #     device,
+    #     thold=tholds,
+    #     text_features=text_features,
+    #     dataset_name=ood_dataset,
     # )
-    # scores_out_test = distance_score(model, out_loader, 10, class_means, device, tholds)
-    # scores_out_test = fdbd_score(model, out_loader, 10, class_means, device)
-    # scores_out_test = React_energy(model, out_loader, 10, class_means, device, tholds)
-    # scores_out_test = knn_score(model, out_loader, 10, class_means, device, train_feats)
-
+    # scores_out_test = plain_cos_score(
+    #     model,
+    #     out_loader,
+    #     1000,
+    #     class_means,
+    #     device,
+    #     thold=tholds,
+    #     text_features=text_features,
+    #     dataset_name=ood_dataset,
+    # )
+    # scores_out_test = energy_score(model, out_loader, 1000, class_means, device, tholds)
+    # scores_out_test = msp_score(model, out_loader, 1000, class_means, device, tholds, dataset_name=ood_dataset)
+    # scores_out_test = fdbd_score(model, out_loader, 1000, class_means, device)
+    # scores_out_test = React_energy(model, out_loader, 1000, class_means, device, tholds)
+    # scores_out_test = knn_score(model, out_loader, 1000, class_means, device, train_feats)
     # plot histograms
-    # import matplotlib.pyplot as plt
-    # plot_helper(score_in, scores_out_test, args.in_dataset, ood_dataset, function_name="LAFO")
+    import matplotlib.pyplot as plt
+
+    plot_helper(
+        score_in, scores_out_test, args.in_dataset, ood_dataset, function_name="LAFO"
+    )
+
+    # scores_out_test = torch.sum(logits_sub/denominator_matrix[nn_idx], axis=1)/torch.norm(feat_log - train_mean , dim = 1)
+    # scores_out_test = scores_out_test.float().cpu().numpy()
     all_score_out.extend(scores_out_test)
     results = metrics.cal_metric(score_in, scores_out_test)
     all_results.append(results)
 
 metrics.print_all_results(all_results, args.out_datasets, "fDBD")
 print()
-
-
-# #################### SSD+ score OOD detection #################
-# begin = time.time()
-# mean_feat = ftrain.mean(0)
-# std_feat = ftrain.std(0)
-# prepos_feat_ssd = lambda x: (x - mean_feat) / (std_feat + 1e-10)
-# ftrain_ssd = prepos_feat_ssd(ftrain)
-# ftest_ssd = prepos_feat_ssd(ftest)
-# food_ssd_all = {}
-# for ood_dataset in args.out_datasets:
-#     food_ssd_all[ood_dataset] = prepos_feat_ssd(food_all[ood_dataset])
-#
-# inv_sigma_cls = [None for _ in range(class_num)]
-# covs_cls = [None for _ in range(class_num)]
-# mean_cls = [None for _ in range(class_num)]
-# cov = lambda x: np.cov(x.T, bias=True)
-# for cls in range(class_num):
-#     mean_cls[cls] = ftrain_ssd[label_log == cls].mean(0)
-#     feat_cls_center = ftrain_ssd[label_log == cls] - mean_cls[cls]
-#     inv_sigma_cls[cls] = np.linalg.pinv(cov(feat_cls_center))
-#
-# def maha_score(X):
-#     score_cls = np.zeros((class_num, len(X)))
-#     for cls in range(class_num):
-#         inv_sigma = inv_sigma_cls[cls]
-#         mean = mean_cls[cls]
-#         z = X - mean
-#         score_cls[cls] = -np.sum(z * (inv_sigma.dot(z.T)).T, axis=-1)
-#     return score_cls.max(0)
-#
-# dtest = maha_score(ftest_ssd)
-# all_results = []
-# for name, food in food_ssd_all.items():
-#     print(f"SSD+: Evaluating {name}")
-#     dood = maha_score(food)
-#     results = metrics.cal_metric(dtest, dood)
-#     all_results.append(results)
-#
-# metrics.print_all_results(all_results, args.out_datasets, 'SSD+')
-# print(time.time() - begin)
