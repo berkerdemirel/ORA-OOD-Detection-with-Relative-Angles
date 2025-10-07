@@ -185,7 +185,6 @@ def ora_score(
             for class_id in class_idx:
                 logit_diff = max_logits - logits_batch_initial[:, class_id]
                 weight_diff = model.fc.weight[preds_initial] - model.fc.weight[class_id]
-                # weight_diff = model.classifier.weight[preds_initial] - model.classifier.weight[class_id]
                 weight_diff_norm = torch.linalg.norm(weight_diff, dim=1)
 
                 feats_batch_db = (
@@ -196,10 +195,6 @@ def ora_score(
 
                 centered_feats = feats_batch_initial - torch.mean(class_means, dim=0)
                 centered_feats_db = feats_batch_db - torch.mean(class_means, dim=0)
-                # centered_feats = feats_batch_initial - torch.median(class_means, dim=0).values
-                # centered_feats_db = feats_batch_db - torch.median(class_means, dim=0).values
-                # centered_feats = feats_batch_initial - class_means[0]
-                # centered_feats_db = feats_batch_db - class_means[0]
 
                 norm_centered_feats = F.normalize(centered_feats, p=2, dim=1)
                 norm_centered_feats_db = F.normalize(centered_feats_db, p=2, dim=1)
@@ -399,23 +394,11 @@ def rel_mahalonobis_distance_score(
     tholds: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
 
-    # -------------------------------------------------------------------------
-    # Move model to device and set eval mode
-    # -------------------------------------------------------------------------
     model = model.to(device)
     model.eval()
 
-    # -------------------------------------------------------------------------
-    # 1. Compute class-wise precision matrix (prec) based on ID features
-    #    - For each sample in id_feats, subtract the corresponding class mean
-    #    - Fit EmpiricalCovariance on the centered features
-    # -------------------------------------------------------------------------
-    # Collect all centered features for class-wise covariance
-    # (in_labels and class_means are assumed to be consistent)
     train_feat_centered = []
     with torch.no_grad():
-        # If these are already on CPU, you can skip .cpu()
-        # but we do so to ensure numpy usage below.
         id_feats_cpu = id_feats.cpu().numpy()
         in_labels_cpu = in_labels.cpu().numpy()
         class_means_cpu = class_means.cpu().numpy()
@@ -423,34 +406,23 @@ def rel_mahalonobis_distance_score(
         for c in range(num_classes):
             # Extract features belonging to class c
             class_mask = in_labels_cpu == c
-            if not np.any(class_mask):
-                # If for some reason this class doesn't exist, skip
-                continue
             feats_c = id_feats_cpu[class_mask]
             mean_c = class_means_cpu[c]
             train_feat_centered.append(feats_c - mean_c)
 
-    # Concatenate all centered features
     if len(train_feat_centered) == 0:
         raise ValueError("No features found for computing class-wise covariance.")
 
     train_feat_centered = np.concatenate(train_feat_centered, axis=0)
 
-    # Fit Empirical Covariance to get class-wise precision
     ec_classwise = EmpiricalCovariance(assume_centered=True)
     ec_classwise.fit(train_feat_centered.astype(np.float64))
     prec_classwise = ec_classwise.precision_  # shape (D, D)
 
-    # Convert to torch on device
     prec_classwise_t = torch.from_numpy(prec_classwise).to(
         device=device, dtype=torch.double
     )
 
-    # -------------------------------------------------------------------------
-    # 2. Compute global precision matrix (prec_global)
-    #    - Single global mean from all id_feats
-    #    - Fit EmpiricalCovariance on id_feats - global_mean
-    # -------------------------------------------------------------------------
     global_mean = id_feats_cpu.mean(axis=0)
     train_feat_centered_global = id_feats_cpu - global_mean
 
@@ -458,66 +430,36 @@ def rel_mahalonobis_distance_score(
     ec_global.fit(train_feat_centered_global.astype(np.float64))
     prec_global = ec_global.precision_
 
-    # Convert to torch on device
     global_mean_t = torch.from_numpy(global_mean).to(device=device, dtype=torch.double)
     prec_global_t = torch.from_numpy(prec_global).to(device=device, dtype=torch.double)
 
-    # -------------------------------------------------------------------------
-    # 3. For each batch in test_loader, compute the relative Mahalanobis score
-    #    If test_loader already provides features, we skip model(...)
-    #    If test_loader provides inputs, you'd do feats = model(inputs).
-    #
-    #    Score steps:
-    #      - classwise_score(x) = - min_c [ (x - mean_c)^T @ prec_classwise @ (x - mean_c) ]
-    #      - global_score(x)    = - [ (x - global_mean)^T @ prec_global @ (x - global_mean) ]
-    #      - final_score(x)     = classwise_score(x) - global_score(x)
-    #
-    # -------------------------------------------------------------------------
     all_scores = []
 
     with torch.no_grad():
         for feats_batch, _ in test_loader:
-            # If you need to compute features from model, uncomment:
-            # feats_batch = model(feats_batch.to(device))
-            # Otherwise, assume feats_batch is already the features:
             feats_batch = feats_batch.to(device, dtype=torch.double)
 
-            # Expand feats to (B, 1, D) and class_means to (1, C, D) for vectorized distance
             B = feats_batch.size(0)
             feats_expanded = feats_batch.unsqueeze(1)  # (B, 1, D)
             means_expanded = class_means.to(device, dtype=torch.double).unsqueeze(
                 0
             )  # (1, C, D)
             diff_classwise = feats_expanded - means_expanded  # (B, C, D)
-
-            # (x - mean_c) @ prec_classwise -> shape (B, C, D)
-            # Then elementwise * diff_classwise and sum over D => (B, C)
-            # We'll do a manual matmul: (diff_classwise @ prec_classwise) => (B, C, D)
             temp = torch.matmul(diff_classwise, prec_classwise_t)  # (B, C, D)
-            # Then multiply elementwise by diff_classwise and sum along D
-            # This is the Mahalanobis distance for each sample to each class
             mahalanobis_classwise = (temp * diff_classwise).sum(dim=-1)  # (B, C)
 
-            # We take the minimum across classes => shape (B,)
             min_maha_classwise = mahalanobis_classwise.min(dim=1).values  # (B,)
-
-            # Negative sign to keep consistent with "score = - Mdist(...)"
             classwise_score = -min_maha_classwise
 
-            # Now compute global Mahalanobis
-            # (x - mean_global) -> (B, D)
             diff_global = feats_batch - global_mean_t
-            # matmul => (B, D)
             temp_global = torch.matmul(diff_global, prec_global_t)  # (B, D)
             mahalanobis_global = (temp_global * diff_global).sum(dim=-1)  # (B,)
             global_score = -mahalanobis_global
 
-            # Relative score = classwise_score - global_score
             rel_scores = classwise_score - global_score
 
             all_scores.append(rel_scores.float().cpu())
 
-    # Concatenate all scores and return as np.float32
     final_scores = torch.cat(all_scores).numpy().astype(np.float32)
     return final_scores
 
@@ -532,21 +474,14 @@ def rel_mahalonobis_distance_score_2(
     device: str,
     tholds: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    # 1) Move model to device, set eval mode.
     model = model.to(device)
     model.eval()
 
-    # 2) Ensure class_means and id_feats are on the same device.
     id_feats = id_feats.to(device, dtype=torch.float32)
     in_labels = in_labels.to(device)
     class_means = class_means.to(device, dtype=torch.float32)
 
-    # -------------------------------------------------------------------------
-    # 3) Build classwise-centered features on GPU
-    #    We gather (z_i - mu_{y_i}) for each sample, for a single shared cov
-    # -------------------------------------------------------------------------
     with torch.no_grad():
-        # This is a list of GPU tensors, each from one class.
         centered_feats_gpu = []
         for c in range(num_classes):
             class_mask = in_labels == c
@@ -556,10 +491,6 @@ def rel_mahalonobis_distance_score_2(
 
         all_centered_feats_gpu = torch.cat(centered_feats_gpu, dim=0)
 
-    # -------------------------------------------------------------------------
-    # 4) Compute EmpiricalCovariance (CPU / scikit-learn)
-    #    So we do one big transfer to CPU
-    # -------------------------------------------------------------------------
     centered_feats_cpu = all_centered_feats_gpu.cpu().numpy()  # shape (N, D)
     ec_classwise = EmpiricalCovariance(assume_centered=True)
     ec_classwise.fit(centered_feats_cpu.astype(np.float64))
@@ -567,61 +498,41 @@ def rel_mahalonobis_distance_score_2(
     prec_classwise = ec_classwise.precision_  # (D, D)
     prec_classwise_t = torch.from_numpy(prec_classwise).to(device, dtype=torch.double)
 
-    # -------------------------------------------------------------------------
-    # 5) Compute global mean and global covariance
-    # -------------------------------------------------------------------------
     with torch.no_grad():
         global_mean_gpu = id_feats.mean(dim=0)  # (D,) on GPU
-
-        # Center globally on GPU
         all_centered_global_gpu = id_feats - global_mean_gpu  # (N, D)
 
-    # Move global-centered feats to CPU for EmpiricalCovariance
     centered_feats_global_cpu = all_centered_global_gpu.cpu().numpy()
     ec_global = EmpiricalCovariance(assume_centered=True)
     ec_global.fit(centered_feats_global_cpu.astype(np.float64))
     prec_global = ec_global.precision_
 
-    # Move global mean & prec back to GPU
     global_mean_t = global_mean_gpu.to(device, dtype=torch.double)
     prec_global_t = torch.from_numpy(prec_global).to(device, dtype=torch.double)
 
-    # -------------------------------------------------------------------------
-    # 6) For each batch in test_loader, compute relative Mahalanobis distance
-    # -------------------------------------------------------------------------
     all_scores = []
     with torch.no_grad():
         for feats_batch, _ in test_loader:
-            # If test_loader returns inputs, you would do:
-            # feats_batch = model(feats_batch.to(device, dtype=torch.float32))
-
             feats_batch = feats_batch.to(device, dtype=torch.double)
-
-            # Expand feats to (B, 1, D) and class_means to (1, C, D)
             B = feats_batch.size(0)
             feats_expanded = feats_batch.unsqueeze(1)  # (B, 1, D)
             means_expanded = class_means.to(device, dtype=torch.double).unsqueeze(0)
-            # means_expanded => (1, C, D)
             diff_classwise = feats_expanded - means_expanded  # (B, C, D)
 
-            # 6a) Classwise Mahalanobis: (x - mu_c)^T @ prec_classwise @ (x - mu_c)
             temp = torch.matmul(diff_classwise, prec_classwise_t)  # (B, C, D)
             mahalanobis_classwise = (temp * diff_classwise).sum(dim=-1)  # (B, C)
 
             min_maha_classwise = mahalanobis_classwise.min(dim=1).values  # (B,)
             classwise_score = -min_maha_classwise
 
-            # 6b) Global Mahalanobis: (x - mu_global)^T @ prec_global @ (x - mu_global)
             diff_global = feats_batch - global_mean_t  # (B, D)
             temp_global = torch.matmul(diff_global, prec_global_t)  # (B, D)
             mahalanobis_global = (temp_global * diff_global).sum(dim=-1)  # (B,)
             global_score = -mahalanobis_global
 
-            # 6c) Relative score = classwise_score - global_score
             rel_scores = classwise_score - global_score
             all_scores.append(rel_scores.float().cpu())
 
-    # Concatenate and return
     final_scores = torch.cat(all_scores).numpy().astype(np.float32)
     return final_scores
 
@@ -636,20 +547,9 @@ def mds_score(
     device: str,
     tholds: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    # -------------------------------------------------------------------------
-    # 1) Move model to device and set it to eval
-    #    (Only needed if you plan to pass raw inputs through model)
-    # -------------------------------------------------------------------------
     model = model.to(device)
     model.eval()
 
-    # -------------------------------------------------------------------------
-    # 2) Compute the shared covariance matrix from classwise-centered features
-    #    Because scikit-learn EmpiricalCovariance requires CPU+NumPy, we do:
-    #       - Center each ID feature by its class mean on GPU
-    #       - Concatenate
-    #       - Move once to CPU, fit EmpiricalCovariance
-    # -------------------------------------------------------------------------
     id_feats = id_feats.to(device, dtype=torch.float32)  # (N, D)
     in_labels = in_labels.to(device)
     class_means = class_means.to(device, dtype=torch.float32)
@@ -658,9 +558,6 @@ def mds_score(
         centered_gpu_list = []
         for c in range(num_classes):
             class_mask = in_labels == c
-            if not torch.any(class_mask):
-                # If a class doesn't appear in your ID set, skip it
-                continue
             feats_c = id_feats[class_mask]  # (Nc, D)
             mean_c = class_means[c]  # (D,)
             centered_gpu_list.append(feats_c - mean_c)  # center on GPU
@@ -668,48 +565,31 @@ def mds_score(
         if len(centered_gpu_list) == 0:
             raise ValueError("No features found to compute classwise covariance.")
 
-        # Concatenate all classwise-centered features => (N, D)
         all_centered_feats = torch.cat(centered_gpu_list, dim=0)
 
-    # Move to CPU for EmpiricalCovariance
     all_centered_feats_cpu = all_centered_feats.cpu().numpy()
-
-    # Fit EmpiricalCovariance
     ec = EmpiricalCovariance(assume_centered=True)
     ec.fit(all_centered_feats_cpu.astype(np.float64))
     prec = ec.precision_  # (D, D)
 
-    # Convert precision matrix to torch on device
     prec_t = torch.from_numpy(prec).to(device=device, dtype=torch.double)
 
-    # -------------------------------------------------------------------------
-    # 3) For each test sample, compute min_{c} Mahalanobis distance, then *-1
-    #    (We treat the negative distance as a "score"—the more negative,
-    #     the further from ID.)
-    # -------------------------------------------------------------------------
     all_scores = []
 
     with torch.no_grad():
         for feats_batch, _ in test_loader:
-            # If test_loader gives raw inputs, do: feats_batch = model(feats_batch.to(device))
             feats_batch = feats_batch.to(device, dtype=torch.double)
 
-            # Expand feats => (B, 1, D), class_means => (1, C, D)
             B = feats_batch.size(0)
             feats_expanded = feats_batch.unsqueeze(1)  # (B, 1, D)
             means_expanded = class_means.to(device, dtype=torch.double).unsqueeze(
                 0
             )  # (1, C, D)
             diff_classwise = feats_expanded - means_expanded  # (B, C, D)
-
-            # Compute Mdist => (diff @ prec) * diff, sum over D => (B, C)
             temp = torch.matmul(diff_classwise, prec_t)  # (B, C, D)
             maha_dists = (temp * diff_classwise).sum(dim=-1)  # (B, C)
 
-            # For each sample, take the minimum distance across classes
             min_maha = maha_dists.min(dim=1).values  # (B,)
-
-            # Our Mahalanobis score is -min_maha
             maha_scores = -min_maha
             all_scores.append(maha_scores.float().cpu())
 
@@ -761,31 +641,6 @@ def nci_score(
     device: str,
     alpha: float = 0.0001,  # NCI hyper‑parameter
 ) -> np.ndarray:
-    """
-    “Nearest‑Class Influence” (NCI) OOD score.
-
-    Parameters
-    ----------
-    model : torch.nn.Module
-        Classification network with a fully‑connected head called `fc`
-        (change to `classifier` if that’s what your model uses).
-    test_loader : DataLoader
-        Each iteration should return a tuple `(features, logits)` where:
-            • features – tensor of shape (B, d)
-            • logits   – tensor of shape (B, num_classes)
-    train_mean : torch.Tensor
-        Feature mean of in‑distribution training data (shape: (d,)).
-    device : str
-        "cuda" or "cpu".
-    alpha : float, default 0.0
-        Weight of the ‖feature‖₁ regulariser (as in the original NCI paper).
-
-    Returns
-    -------
-    np.ndarray
-        1‑D array of OOD scores for every sample in `test_loader`
-        (higher ⇒ more in‑distribution‑like, exactly as in NCI).
-    """
     model = model.to(device).eval()
     w = model.fc.weight.to(device)  # (num_classes, d)
     train_mean = train_mean.to(device)  # (d,)
@@ -817,20 +672,13 @@ def mahalanobisplus_score(
     num_classes: int,
     device: str = "cuda",
 ) -> np.ndarray:
-    """
-    Numerically identical to `evaluate_Mahalanobis_norm`, but works with a
-    DataLoader and keeps GPU memory low.
-    Returns: np.ndarray (N_test,)   — higher ⇒ more ID‑like.
-    """
 
-    # ---------------------------------------------------------------- 1) normalise train feats (CPU, float64)
     feats_np = train_feats.detach().cpu().numpy().astype(np.float64)
     labels_np = train_labels.detach().cpu().numpy().astype(np.int64)
     feats_np /= np.linalg.norm(feats_np, axis=1, keepdims=True)
 
     d = feats_np.shape[1]
 
-    # ---------------------------------------------------------------- 2) per‑class means (exact loop)
     class_means_np = np.zeros((num_classes, d), dtype=np.float64)
     centered_list = []
 
@@ -844,16 +692,13 @@ def mahalanobisplus_score(
 
     centered_np = np.concatenate(centered_list, axis=0)
 
-    # ---------------------------------------------------------------- 3) empirical covariance (sklearn)
     ec = EmpiricalCovariance(assume_centered=True)
     ec.fit(centered_np)
     precision_np = ec.precision_  # (d,d)  float64
 
-    # ---------------------------------------------------------------- 4) move to GPU (still float64)
     precision = torch.from_numpy(precision_np).to(device, torch.float64)
     class_means = torch.from_numpy(class_means_np).to(device, torch.float64)  # (C,d)
 
-    # ---------------------------------------------------------------- 5) scorer (no (B,C,d) tensor)
     def _score_batch(feats_b: torch.Tensor) -> torch.Tensor:
         feats_b = feats_b.to(device, torch.float64)
         feats_b = feats_b / feats_b.norm(dim=1, keepdim=True)  # row‑wise L2
@@ -875,7 +720,7 @@ def mahalanobisplus_score(
     for feats_b, _ in test_loader:
         scores.extend(_score_batch(feats_b))  # add the floats, not the array
 
-    return np.asarray(scores, dtype=np.float64)  # shape (N_test,)
+    return np.asarray(scores, dtype=np.float64)
 
 
 @torch.inference_mode()
@@ -886,15 +731,8 @@ def neco_score(
     use_logit: bool = True,
     device: str = "cuda",
 ) -> np.ndarray:
-    """
-    **Exact** replica of `evaluate_neco`, but DataLoader‑friendly.
-    Returns scores for *all* samples in `test_loader` (ID and OOD mixed),
-    in the same order they are yielded.
-    """
-
     os.makedirs(path, exist_ok=True)
 
-    # ------------------------------------------------------------------- 1) fit / load StandardScaler
     ss_path = os.path.join(path, "ss_neco_deitpre.pkl")
     if os.path.exists(ss_path):
         with open(ss_path, "rb") as f:
@@ -906,7 +744,6 @@ def neco_score(
         with open(ss_path, "wb") as f:
             pickle.dump(ss, f)
 
-    # ------------------------------------------------------------------- 2) fit / load PCA
     pca_path = os.path.join(path, "pca_neco_deitpre.pkl")
     if os.path.exists(pca_path):
         with open(pca_path, "rb") as f:
@@ -917,24 +754,20 @@ def neco_score(
         with open(pca_path, "wb") as f:
             pickle.dump(pca, f)
 
-    # cumulative explained variance → neco_dim (≥ 90 %)
     cum_var = np.cumsum(pca.explained_variance_ratio_)
-    neco_dim = np.where(cum_var >= 0.90)[0][0] + 1  # identical logic
+    neco_dim = np.where(cum_var >= 0.90)[0][0] + 1
 
-    # ------------------------------------------------------------------- 3) stream over test_loader
     all_scores = []
 
-    for feats_b, logits_b in test_loader:  # logits_b needed for max‑logit
+    for feats_b, logits_b in test_loader:
         feats_np = feats_b.cpu().numpy()
         logits_np = logits_b.cpu().numpy()
 
         # standardize
         complete_vecs = ss.transform(feats_np)  # (B, d)
 
-        # PCA transform, then slice first neco_dim components
         reduced = pca.transform(complete_vecs)[:, :neco_dim]  # (B, neco_dim)
 
-        # norms & ratio
         full_norm = np.linalg.norm(complete_vecs, axis=1)
         red_norm = np.linalg.norm(reduced, axis=1)
         ratio = red_norm / full_norm  # (B,)
@@ -945,4 +778,4 @@ def neco_score(
 
         all_scores.append(ratio)
 
-    return np.concatenate(all_scores, axis=0)  # (N_test,)
+    return np.concatenate(all_scores, axis=0)

@@ -6,8 +6,6 @@ import torchvision
 from easydict import EasyDict
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from util.dataset_largescale import DatasetWithMeta
-from util.imglist_dataset import ImglistDataset
 
 imagesize = 32
 
