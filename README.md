@@ -1,6 +1,6 @@
 # ORA: Out-of-Distribution Detection with Relative Angles
 
-This repository contains the official implementation for the paper [**"Out-of-Distribution Detection with Relative Angles"**](https://arxiv.org/abs/2410.04525) (NeurIPS 2025).
+This repository contains the official implementation for the paper [**"Out-of-Distribution Detection with Relative Angles"**](https://openreview.net/pdf?id=ul5mlXrLZb) (NeurIPS 2025).
 
 Our work introduces ORA, a novel method for Out-of-Distribution (OOD) detection that leverages the concept of relative angles in the feature space. By analyzing the angular displacement of a test sample with respect to class prototypes, ORA provides a robust and effective signal for distinguishing in-distribution (ID) data from OOD data.
 
